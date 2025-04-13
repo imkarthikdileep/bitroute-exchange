@@ -1,19 +1,17 @@
 [build]
   command = "npm run build"
   publish = "dist"
+  functions = "functions"  # Specify the functions directory
 
 [build.environment]
   NODE_VERSION = "20"
+  VITE_SIGNAL_SERVER_URL = "wss://signaling.bitroute.io"
 
 # Handle SPA routing
 [[redirects]]
   from = "/*"
   to = "/index.html"
   status = 200
-
-# Environment variable declarations
-[build.environment]
-  VITE_SIGNAL_SERVER_URL = "wss://signaling.bitroute.io"
 
 # Security headers for WebRTC
 [[headers]]

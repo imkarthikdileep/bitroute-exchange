@@ -35,8 +35,12 @@ interface FileTransfer {
   status: 'preparing' | 'transferring' | 'completed' | 'error';
 }
 
-// Signal server URL - using environment variable or fallback
-const SIGNAL_SERVER_URL = import.meta.env.VITE_SIGNAL_SERVER_URL || 'wss://signaling.bitroute.io';
+// Signal server URLs with fallback
+const SIGNAL_SERVERS = [
+  import.meta.env.VITE_SIGNAL_SERVER_URL,
+  'wss://bitroute-signaling.herokuapp.com',
+  'wss://bitroute-fallback.onrender.com'
+];
 
 // Configuration for the WebRTC connection
 const iceServers = {
@@ -169,6 +173,7 @@ class CryptoUtils {
 
 export class WebRTCFileTransfer {
   private ws: WebSocket | null = null;
+  private currentServerIndex: number = 0;
   private peerConnection: PeerConnection | null = null;
   private localSessionDescription: RTCSessionDescription | null = null;
   private roomId: string | null = null;
@@ -207,56 +212,61 @@ export class WebRTCFileTransfer {
       
       try {
         // Connect to signaling server
-        this.ws = new WebSocket(SIGNAL_SERVER_URL);
-        
-        this.ws.onopen = () => {
-          if (this.ws) {
-            this.ws.send(JSON.stringify({
-              type: 'create',
-              roomId: this.roomId
-            }));
-          }
-        };
-        
-        this.ws.onmessage = async (event) => {
-          try {
-            const message = JSON.parse(event.data);
-            
-            if (message.type === 'room_created') {
-              clearTimeout(timeout);
-              // Room created, create P2P connection
-              await this.setupSenderPeerConnection();
-              const shareableLink = `${window.location.origin}/receive?room=${this.roomId}`;
-              resolve(shareableLink);
-            } else if (message.type === 'error') {
-              clearTimeout(timeout);
-              reject(new Error(message.message || 'Failed to create room'));
-            } else if (message.type === 'answer') {
-              // Receiver has sent their SDP answer
-              await this.handleReceiverAnswer(message.sdp);
-            } else if (message.type === 'ice_candidate') {
-              // Add ICE candidate from receiver
-              if (this.peerConnection) {
-                await this.peerConnection.connection.addIceCandidate(
-                  new RTCIceCandidate(message.candidate)
-                );
-              }
+        this.connectToSignalingServer().then((ws) => {
+          this.ws = ws;
+          
+          this.ws.onopen = () => {
+            if (this.ws) {
+              this.ws.send(JSON.stringify({
+                type: 'create',
+                roomId: this.roomId
+              }));
             }
-          } catch (error) {
+          };
+          
+          this.ws.onmessage = async (event) => {
+            try {
+              const message = JSON.parse(event.data);
+              
+              if (message.type === 'room_created') {
+                clearTimeout(timeout);
+                // Room created, create P2P connection
+                await this.setupSenderPeerConnection();
+                const shareableLink = `${window.location.origin}/receive?room=${this.roomId}`;
+                resolve(shareableLink);
+              } else if (message.type === 'error') {
+                clearTimeout(timeout);
+                reject(new Error(message.message || 'Failed to create room'));
+              } else if (message.type === 'answer') {
+                // Receiver has sent their SDP answer
+                await this.handleReceiverAnswer(message.sdp);
+              } else if (message.type === 'ice_candidate') {
+                // Add ICE candidate from receiver
+                if (this.peerConnection) {
+                  await this.peerConnection.connection.addIceCandidate(
+                    new RTCIceCandidate(message.candidate)
+                  );
+                }
+              }
+            } catch (error) {
+              clearTimeout(timeout);
+              reject(new Error('Invalid response from server'));
+            }
+          };
+          
+          this.ws.onerror = (error) => {
             clearTimeout(timeout);
-            reject(new Error('Invalid response from server'));
-          }
-        };
-        
-        this.ws.onerror = (error) => {
-          clearTimeout(timeout);
-          reject(new Error('Connection failed - please check your internet connection'));
-        };
+            reject(new Error('Connection failed - please check your internet connection'));
+          };
 
-        this.ws.onclose = () => {
+          this.ws.onclose = () => {
+            clearTimeout(timeout);
+            reject(new Error('Connection closed unexpectedly'));
+          };
+        }).catch((error) => {
           clearTimeout(timeout);
-          reject(new Error('Connection closed unexpectedly'));
-        };
+          reject(new Error('Failed to establish connection'));
+        });
       } catch (error) {
         clearTimeout(timeout);
         reject(new Error('Failed to establish connection'));
@@ -271,41 +281,45 @@ export class WebRTCFileTransfer {
       this.roomId = roomId;
       
       // Connect to signaling server
-      this.ws = new WebSocket(SIGNAL_SERVER_URL);
-      
-      this.ws.onopen = () => {
-        if (this.ws) {
-          this.ws.send(JSON.stringify({
-            type: 'join',
-            roomId: this.roomId
-          }));
-        }
-      };
-      
-      this.ws.onmessage = async (event) => {
-        const message = JSON.parse(event.data);
+      this.connectToSignalingServer().then((ws) => {
+        this.ws = ws;
         
-        if (message.type === 'room_joined') {
-          await this.setupReceiverPeerConnection(onFileReceived);
-          resolve();
-        } else if (message.type === 'offer') {
-          // Received SDP offer from sender
-          await this.handleSenderOffer(message.sdp, message.publicKey);
-        } else if (message.type === 'ice_candidate') {
-          // Add ICE candidate from sender
-          if (this.peerConnection) {
-            await this.peerConnection.connection.addIceCandidate(
-              new RTCIceCandidate(message.candidate)
-            );
+        this.ws.onopen = () => {
+          if (this.ws) {
+            this.ws.send(JSON.stringify({
+              type: 'join',
+              roomId: this.roomId
+            }));
           }
-        } else if (message.type === 'error') {
-          reject(new Error(message.message));
-        }
-      };
-      
-      this.ws.onerror = (error) => {
+        };
+        
+        this.ws.onmessage = async (event) => {
+          const message = JSON.parse(event.data);
+          
+          if (message.type === 'room_joined') {
+            await this.setupReceiverPeerConnection(onFileReceived);
+            resolve();
+          } else if (message.type === 'offer') {
+            // Received SDP offer from sender
+            await this.handleSenderOffer(message.sdp, message.publicKey);
+          } else if (message.type === 'ice_candidate') {
+            // Add ICE candidate from sender
+            if (this.peerConnection) {
+              await this.peerConnection.connection.addIceCandidate(
+                new RTCIceCandidate(message.candidate)
+              );
+            }
+          } else if (message.type === 'error') {
+            reject(new Error(message.message));
+          }
+        };
+        
+        this.ws.onerror = (error) => {
+          reject(error);
+        };
+      }).catch((error) => {
         reject(error);
-      };
+      });
     });
   }
   
@@ -836,6 +850,39 @@ export class WebRTCFileTransfer {
         return transfer && transfer.file !== file;
       });
     }
+  }
+
+  private async connectToSignalingServer(): Promise<WebSocket> {
+    const maxRetries = 3;
+    let lastError: Error | null = null;
+
+    for (let retry = 0; retry < maxRetries; retry++) {
+      for (let i = 0; i < SIGNAL_SERVERS.length; i++) {
+        const serverUrl = SIGNAL_SERVERS[(this.currentServerIndex + i) % SIGNAL_SERVERS.length];
+        try {
+          const ws = new WebSocket(serverUrl);
+          await new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => reject(new Error('Connection timeout')), 5000);
+            ws.onopen = () => {
+              clearTimeout(timeout);
+              resolve(ws);
+            };
+            ws.onerror = (error) => {
+              clearTimeout(timeout);
+              reject(error);
+            };
+          });
+          this.currentServerIndex = (this.currentServerIndex + i) % SIGNAL_SERVERS.length;
+          return ws;
+        } catch (error) {
+          lastError = error as Error;
+          continue;
+        }
+      }
+      // Wait before retry
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    throw lastError || new Error('Failed to connect to any signaling server');
   }
 }
 export interface FileTransferProgress {
