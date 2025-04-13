@@ -19,4 +19,7 @@ export default defineConfig(({ mode }) => ({
       "@": path.resolve(__dirname, "./src"),
     },
   },
+  define: {
+    __SIGNAL_SERVER_URL__: JSON.stringify(process.env.VITE_SIGNAL_SERVER_URL || 'wss://signaling.bitroute.io')
+  }
 }));

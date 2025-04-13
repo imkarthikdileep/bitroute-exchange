@@ -35,8 +35,8 @@ interface FileTransfer {
   status: 'preparing' | 'transferring' | 'completed' | 'error';
 }
 
-// Signal server URL - in a real implementation, this would be your WebSocket server endpoint
-const SIGNAL_SERVER_URL = 'wss://your-signaling-server.com';
+// Signal server URL - using environment variable or fallback
+const SIGNAL_SERVER_URL = import.meta.env.VITE_SIGNAL_SERVER_URL || 'wss://signaling.bitroute.io';
 
 // Configuration for the WebRTC connection
 const iceServers = {
@@ -45,9 +45,14 @@ const iceServers = {
     { urls: 'stun:stun1.l.google.com:19302' },
     // Add TURN servers for fallback in restrictive networks
     {
-      urls: 'turn:your-turn-server.com',
-      username: 'username',
-      credential: 'credential'
+      urls: [
+        'turn:a.relay.metered.ca:80',
+        'turn:a.relay.metered.ca:80?transport=tcp',
+        'turn:a.relay.metered.ca:443',
+        'turn:a.relay.metered.ca:443?transport=tcp'
+      ],
+      username: 'e8e9e953f454d975e462a697',  // Replace with your actual credentials
+      credential: 'R+g+k/n6knTV8Gwi'
     }
   ]
 };
