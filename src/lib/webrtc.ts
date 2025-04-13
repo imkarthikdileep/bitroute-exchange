@@ -57,6 +57,116 @@ const iceServers = {
   ]
 };
 
+// Encryption related interfaces
+interface EncryptionKeys {
+  publicKey: JsonWebKey;
+  privateKey: CryptoKey;
+}
+
+interface EncryptedData {
+  iv: Uint8Array;
+  data: ArrayBuffer;
+}
+
+// Crypto utilities
+class CryptoUtils {
+  static async generateKeyPair(): Promise<EncryptionKeys> {
+    const keyPair = await window.crypto.subtle.generateKey(
+      {
+        name: "RSA-OAEP",
+        modulusLength: 2048,
+        publicExponent: new Uint8Array([1, 0, 1]),
+        hash: "SHA-256",
+      },
+      true,
+      ["encrypt", "decrypt"]
+    );
+
+    const publicKey = await window.crypto.subtle.exportKey(
+      "jwk",
+      keyPair.publicKey
+    );
+
+    return {
+      publicKey,
+      privateKey: keyPair.privateKey
+    };
+  }
+
+  static async importPublicKey(jwk: JsonWebKey): Promise<CryptoKey> {
+    return await window.crypto.subtle.importKey(
+      "jwk",
+      jwk,
+      {
+        name: "RSA-OAEP",
+        hash: "SHA-256",
+      },
+      true,
+      ["encrypt"]
+    );
+  }
+
+  static async encryptData(data: ArrayBuffer, publicKey: CryptoKey): Promise<EncryptedData> {
+    const iv = window.crypto.getRandomValues(new Uint8Array(12));
+    const key = await window.crypto.subtle.generateKey(
+      { name: "AES-GCM", length: 256 },
+      true,
+      ["encrypt"]
+    );
+
+    const encryptedData = await window.crypto.subtle.encrypt(
+      { name: "AES-GCM", iv },
+      key,
+      data
+    );
+
+    const exportedKey = await window.crypto.subtle.exportKey("raw", key);
+    const encryptedKey = await window.crypto.subtle.encrypt(
+      { name: "RSA-OAEP" },
+      publicKey,
+      exportedKey
+    );
+
+    const combined = new Uint8Array(encryptedKey.byteLength + encryptedData.byteLength);
+    combined.set(new Uint8Array(encryptedKey), 0);
+    combined.set(new Uint8Array(encryptedData), encryptedKey.byteLength);
+
+    return {
+      iv,
+      data: combined.buffer
+    };
+  }
+
+  static async decryptData(
+    encryptedData: EncryptedData,
+    privateKey: CryptoKey
+  ): Promise<ArrayBuffer> {
+    const data = new Uint8Array(encryptedData.data);
+    const encryptedKey = data.slice(0, 256); // RSA-2048 encrypted key is 256 bytes
+    const actualData = data.slice(256);
+
+    const keyData = await window.crypto.subtle.decrypt(
+      { name: "RSA-OAEP" },
+      privateKey,
+      encryptedKey
+    );
+
+    const key = await window.crypto.subtle.importKey(
+      "raw",
+      keyData,
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["decrypt"]
+    );
+
+    return await window.crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: encryptedData.iv },
+      key,
+      actualData
+    );
+  }
+}
+
 export class WebRTCFileTransfer {
   private ws: WebSocket | null = null;
   private peerConnection: PeerConnection | null = null;
@@ -65,64 +175,92 @@ export class WebRTCFileTransfer {
   private isSender: boolean = false;
   private transferQueue: File[] = [];
   private isProcessingQueue: boolean = false;
+  private encryptionKeys: EncryptionKeys | null = null;
+  private peerPublicKey: JsonWebKey | null = null;
   
   // Dynamic chunk size calculation based on file size
   private getOptimalChunkSize(fileSize: number): number {
     if (fileSize < 1024 * 1024) { // < 1MB
-      return 16 * 1024; // 16KB
+      return 64 * 1024; // 64KB (increased from 16KB)
     } else if (fileSize < 10 * 1024 * 1024) { // < 10MB
-      return 64 * 1024; // 64KB
+      return 256 * 1024; // 256KB (increased from 64KB)
     } else if (fileSize < 100 * 1024 * 1024) { // < 100MB
-      return 256 * 1024; // 256KB
+      return 1024 * 1024; // 1MB (increased from 256KB)
     } else {
-      return 1024 * 1024; // 1MB for very large files
+      return 2 * 1024 * 1024; // 2MB for very large files (increased from 1MB)
     }
   }
 
   // Create and return a shareable link for receivers
   public async createRoom(): Promise<string> {
     return new Promise((resolve, reject) => {
+      // Add connection timeout
+      const timeout = setTimeout(() => {
+        if (this.ws) {
+          this.ws.close();
+        }
+        reject(new Error('Connection timeout - please try again'));
+      }, 15000); // 15 second timeout
+
       this.isSender = true;
       this.roomId = this.generateRoomId();
       
-      // Connect to signaling server
-      this.ws = new WebSocket(SIGNAL_SERVER_URL);
-      
-      this.ws.onopen = () => {
-        if (this.ws) {
-          this.ws.send(JSON.stringify({
-            type: 'create',
-            roomId: this.roomId
-          }));
-        }
-      };
-      
-      this.ws.onmessage = async (event) => {
-        const message = JSON.parse(event.data);
+      try {
+        // Connect to signaling server
+        this.ws = new WebSocket(SIGNAL_SERVER_URL);
         
-        if (message.type === 'room_created') {
-          // Room created, create P2P connection
-          await this.setupSenderPeerConnection();
-          const shareableLink = `${window.location.origin}/receive?room=${this.roomId}`;
-          resolve(shareableLink);
-        } else if (message.type === 'error') {
-          reject(new Error(message.message));
-        } else if (message.type === 'answer') {
-          // Receiver has sent their SDP answer
-          await this.handleReceiverAnswer(message.sdp);
-        } else if (message.type === 'ice_candidate') {
-          // Add ICE candidate from receiver
-          if (this.peerConnection) {
-            await this.peerConnection.connection.addIceCandidate(
-              new RTCIceCandidate(message.candidate)
-            );
+        this.ws.onopen = () => {
+          if (this.ws) {
+            this.ws.send(JSON.stringify({
+              type: 'create',
+              roomId: this.roomId
+            }));
           }
-        }
-      };
-      
-      this.ws.onerror = (error) => {
-        reject(error);
-      };
+        };
+        
+        this.ws.onmessage = async (event) => {
+          try {
+            const message = JSON.parse(event.data);
+            
+            if (message.type === 'room_created') {
+              clearTimeout(timeout);
+              // Room created, create P2P connection
+              await this.setupSenderPeerConnection();
+              const shareableLink = `${window.location.origin}/receive?room=${this.roomId}`;
+              resolve(shareableLink);
+            } else if (message.type === 'error') {
+              clearTimeout(timeout);
+              reject(new Error(message.message || 'Failed to create room'));
+            } else if (message.type === 'answer') {
+              // Receiver has sent their SDP answer
+              await this.handleReceiverAnswer(message.sdp);
+            } else if (message.type === 'ice_candidate') {
+              // Add ICE candidate from receiver
+              if (this.peerConnection) {
+                await this.peerConnection.connection.addIceCandidate(
+                  new RTCIceCandidate(message.candidate)
+                );
+              }
+            }
+          } catch (error) {
+            clearTimeout(timeout);
+            reject(new Error('Invalid response from server'));
+          }
+        };
+        
+        this.ws.onerror = (error) => {
+          clearTimeout(timeout);
+          reject(new Error('Connection failed - please check your internet connection'));
+        };
+
+        this.ws.onclose = () => {
+          clearTimeout(timeout);
+          reject(new Error('Connection closed unexpectedly'));
+        };
+      } catch (error) {
+        clearTimeout(timeout);
+        reject(new Error('Failed to establish connection'));
+      }
     });
   }
   
@@ -152,7 +290,7 @@ export class WebRTCFileTransfer {
           resolve();
         } else if (message.type === 'offer') {
           // Received SDP offer from sender
-          await this.handleSenderOffer(message.sdp);
+          await this.handleSenderOffer(message.sdp, message.publicKey);
         } else if (message.type === 'ice_candidate') {
           // Add ICE candidate from sender
           if (this.peerConnection) {
@@ -219,162 +357,130 @@ export class WebRTCFileTransfer {
   // Send a file to the receiver
   private async sendFile(file: File, onProgress: (progress: FileTransferProgress) => void): Promise<void> {
     return new Promise(async (resolve, reject) => {
-      if (!this.peerConnection || !this.peerConnection.dataChannel) {
-        reject(new Error('No peer connection established'));
+      if (!this.peerConnection?.dataChannel || !this.peerPublicKey) {
+        reject(new Error('No peer connection established or missing encryption keys'));
         return;
       }
       
-      const fileId = this.generateFileId();
-      const chunkSize = this.getOptimalChunkSize(file.size);
-      const fileReader = new FileReader();
-      let offset = 0;
-      
-      // Create file transfer object to track progress
-      const fileTransfer: FileTransfer = {
-        id: fileId,
-        file,
-        buffer: new ArrayBuffer(0),
-        sendProgress: 0,
-        receiveProgress: 0,
-        chunkSize,
-        startTime: Date.now(),
-        bytesTransferred: 0,
-        lastUpdateTime: Date.now(),
-        lastBytes: 0,
-        speed: 0,
-        onProgress,
-        status: 'preparing'
-      };
-      
-      this.peerConnection.transfersInProgress.set(fileId, fileTransfer);
-      
-      // Notify receiver about the incoming file
-      this.peerConnection.dataChannel.send(JSON.stringify({
-        type: 'file_info',
-        id: fileId,
-        name: file.name,
-        size: file.size,
-        chunkSize
-      }));
-      
-      // Update initial progress
-      onProgress({
-        id: fileId,
-        filename: file.name,
-        progress: 0,
-        size: file.size,
-        status: 'transferring',
-        speed: 0,
-        timeRemaining: 0
-      });
-      
-      // Handle file reading and sending
-      fileReader.onload = (e) => {
-        if (!this.peerConnection?.dataChannel || this.peerConnection.dataChannel.readyState !== 'open') {
-          reject(new Error('Data channel not open'));
-          return;
-        }
+      try {
+        const peerPublicKey = await CryptoUtils.importPublicKey(this.peerPublicKey);
+        const fileId = this.generateFileId();
+        const chunkSize = this.getOptimalChunkSize(file.size);
+        const fileReader = new FileReader();
+        let offset = 0;
+        
+        const fileTransfer: FileTransfer = {
+          id: fileId,
+          file,
+          buffer: new ArrayBuffer(0),
+          sendProgress: 0,
+          receiveProgress: 0,
+          chunkSize,
+          startTime: Date.now(),
+          bytesTransferred: 0,
+          lastUpdateTime: Date.now(),
+          lastBytes: 0,
+          speed: 0,
+          onProgress,
+          status: 'preparing'
+        };
+        
+        this.peerConnection.transfersInProgress.set(fileId, fileTransfer);
+        
+        // Initial file info message
+        this.peerConnection.dataChannel.send(JSON.stringify({
+          type: 'file_info',
+          id: fileId,
+          name: file.name,
+          size: file.size,
+          chunkSize
+        }));
 
-        // Check if we need to wait for the buffer to clear
-        const waitForBuffer = () => {
-          if (this.peerConnection?.dataChannel.bufferedAmount > 16777216) { // 16MB buffer threshold
-            setTimeout(waitForBuffer, 100);
+        fileReader.onload = async (e) => {
+          if (this.peerConnection?.dataChannel.readyState !== 'open') {
+            reject(new Error('Data channel not open'));
             return;
           }
-          
-          // Send chunk header
-          this.peerConnection.dataChannel.send(JSON.stringify({
-            type: 'chunk',
-            id: fileId,
-            offset,
-            size: e.target?.result ? (e.target.result as ArrayBuffer).byteLength : 0
-          }));
-          
-          // Send the chunk data
-          if (e.target?.result) {
-            if (e.target?.result instanceof ArrayBuffer) {
-              this.peerConnection.dataChannel.send(new Uint8Array(e.target.result));
-            } else {
-              console.error('Unexpected data type:', typeof e.target?.result);
+
+          const processChunk = async () => {
+            if (this.peerConnection?.dataChannel.bufferedAmount > 8388608) {
+              setTimeout(processChunk, 100);
+              return;
             }
-          }
-          
-          // Continue with the rest of the process
+
+            if (e.target?.result instanceof ArrayBuffer) {
+              const encryptedData = await CryptoUtils.encryptData(e.target.result, peerPublicKey);
+              
+              // Send encrypted chunk
+              this.peerConnection.dataChannel.send(JSON.stringify({
+                type: 'chunk_header',
+                id: fileId,
+                iv: Array.from(encryptedData.iv),
+                size: encryptedData.data.byteLength
+              }));
+              this.peerConnection.dataChannel.send(encryptedData.data);
+              
+              // Update progress
+              offset += chunkSize;
+              const progress = Math.min(100, Math.round((offset / file.size) * 100));
+              
+              updateProgress(progress, offset);
+              
+              if (offset < file.size) {
+                readNextChunk();
+              } else {
+                fileTransfer.status = 'completed';
+                this.peerConnection.dataChannel.send(JSON.stringify({
+                  type: 'file_complete',
+                  id: fileId
+                }));
+                resolve();
+              }
+            }
+          };
+
           processChunk();
         };
 
-        const processChunk = () => {
-          offset += chunkSize;
-          const progress = Math.min(100, Math.round((offset / file.size) * 100));
-          
-          // Rest of the existing progress update code...
-          // Update transfer statistics
+        const updateProgress = (progress: number, offset: number) => {
           const now = Date.now();
-          const timeElapsed = (now - fileTransfer.lastUpdateTime) / 1000; // seconds
+          const timeElapsed = (now - fileTransfer.lastUpdateTime) / 1000;
           
-          if (timeElapsed > 0.5) { // Update every 500ms
+          if (timeElapsed > 0.2) {
             const bytesSinceLast = offset - fileTransfer.lastBytes;
             fileTransfer.speed = bytesSinceLast / timeElapsed;
             fileTransfer.lastBytes = offset;
             fileTransfer.lastUpdateTime = now;
-          }
-          
-          const bytesRemaining = file.size - offset;
-          const timeRemaining = fileTransfer.speed > 0 ? bytesRemaining / fileTransfer.speed : 0;
-          
-          // Update progress
-          onProgress({
-            id: fileId,
-            filename: file.name,
-            progress,
-            size: file.size,
-            status: progress === 100 ? 'completed' : 'transferring',
-            speed: fileTransfer.speed,
-            timeRemaining
-          });
-          
-          if (offset < file.size) {
-            // Continue reading the next chunk
-            readNextChunk();
-          } else {
-            // File transfer completed
-            fileTransfer.status = 'completed';
-            this.peerConnection.dataChannel.send(JSON.stringify({
-              type: 'file_complete',
-              id: fileId
-            }));
-            resolve();
+            
+            onProgress({
+              id: fileId,
+              filename: file.name,
+              progress,
+              size: file.size,
+              status: progress === 100 ? 'completed' : 'transferring',
+              speed: fileTransfer.speed,
+              timeRemaining: (file.size - offset) / fileTransfer.speed
+            });
           }
         };
 
-        waitForBuffer();
-      };
-      
-      fileReader.onerror = (error) => {
-        fileTransfer.status = 'error';
-        onProgress({
-          id: fileId,
-          filename: file.name,
-          progress: 0,
-          size: file.size,
-          status: 'error'
-        });
-        reject(error);
-      };
-      
-      // Read file in chunks
-      const readNextChunk = () => {
-        const slice = file.slice(offset, offset + chunkSize);
-        fileReader.readAsArrayBuffer(slice);
-      };
-      
-      // Start reading the first chunk
-      readNextChunk();
+        const readNextChunk = () => {
+          const slice = file.slice(offset, offset + chunkSize);
+          fileReader.readAsArrayBuffer(slice);
+        };
+
+        readNextChunk();
+      } catch (error) {
+        reject(new Error('Encryption failed: ' + error.message));
+      }
     });
   }
   
   // Setup the WebRTC peer connection for the sender
   private async setupSenderPeerConnection(): Promise<void> {
+    // Generate encryption keys
+    this.encryptionKeys = await CryptoUtils.generateKeyPair();
+    
     // Create RTCPeerConnection
     const connection = new RTCPeerConnection(iceServers);
     
@@ -386,12 +492,13 @@ export class WebRTCFileTransfer {
     // Create data channel for file transfer
     const dataChannel = connection.createDataChannel('fileTransfer', {
       ordered: true,
-      maxRetransmits: 10
+      maxRetransmits: 3,
+      maxPacketLifeTime: 3000
     });
     
     this.peerConnection.dataChannel = dataChannel;
     this.setupDataChannel(dataChannel);
-    
+
     // Create promise to wait for ICE gathering
     const gatheringComplete = new Promise<void>((resolve) => {
       const checkState = () => {
@@ -402,7 +509,7 @@ export class WebRTCFileTransfer {
       connection.onicegatheringstatechange = checkState;
       checkState();
     });
-
+    
     // Handle ICE candidates
     connection.onicecandidate = (event) => {
       if (event.candidate && this.ws) {
@@ -423,12 +530,13 @@ export class WebRTCFileTransfer {
     
     this.localSessionDescription = connection.localDescription;
     
-    // Send offer to signaling server with all ICE candidates
+    // Send offer and public key to signaling server
     if (this.ws && this.localSessionDescription) {
       this.ws.send(JSON.stringify({
         type: 'offer',
         roomId: this.roomId,
-        sdp: this.localSessionDescription
+        sdp: this.localSessionDescription,
+        publicKey: this.encryptionKeys.publicKey // Include public key in offer
       }));
     }
   }
@@ -575,20 +683,42 @@ export class WebRTCFileTransfer {
           console.error('Error parsing message:', error);
         }
       } else if (event.data instanceof ArrayBuffer) {
-        // Binary data (file chunk)
-        if (currentFileInfo) {
-          receiveBuffer.push(event.data);
-          receivedBytes += event.data.byteLength;
+        const data = new Uint8Array(event.data);
+        const headerLength = data[0];
+        
+        if (headerLength > 0) {
+          // Extract header and chunk data
+          const headerBytes = data.slice(1, headerLength + 1);
+          const header = JSON.parse(new TextDecoder().decode(headerBytes));
+          const chunkData = data.slice(headerLength + 1);
           
-          // Calculate progress
-          const progress = Math.round((receivedBytes / currentFileInfo.size) * 100);
-          
-          // Send acknowledgment to sender
-          dataChannel.send(JSON.stringify({
-            type: 'ack',
-            id: currentFileInfo.id,
-            progress
-          }));
+          if (header.type === 'chunk' && currentFileInfo) {
+            receiveBuffer.push(chunkData.buffer);
+            receivedBytes += chunkData.byteLength;
+            
+            // Calculate progress
+            const progress = Math.round((receivedBytes / currentFileInfo.size) * 100);
+            
+            // Send acknowledgment to sender
+            dataChannel.send(JSON.stringify({
+              type: 'ack',
+              id: currentFileInfo.id,
+              progress
+            }));
+          }
+        } else {
+          // Handle legacy binary data format
+          if (currentFileInfo) {
+            receiveBuffer.push(event.data);
+            receivedBytes += event.data.byteLength;
+            
+            const progress = Math.round((receivedBytes / currentFileInfo.size) * 100);
+            dataChannel.send(JSON.stringify({
+              type: 'ack',
+              id: currentFileInfo.id,
+              progress
+            }));
+          }
         }
       }
     };
@@ -602,20 +732,23 @@ export class WebRTCFileTransfer {
   }
   
   // Handle the SDP offer from the sender
-  private async handleSenderOffer(sdp: RTCSessionDescriptionInit): Promise<void> {
+  private async handleSenderOffer(sdp: RTCSessionDescriptionInit, publicKey?: JsonWebKey): Promise<void> {
     if (this.peerConnection) {
-      await this.peerConnection.connection.setRemoteDescription(new RTCSessionDescription(sdp));
+      if (publicKey) {
+        this.peerPublicKey = publicKey;
+      }
+      this.encryptionKeys = await CryptoUtils.generateKeyPair();
       
-      // Create answer
+      await this.peerConnection.connection.setRemoteDescription(new RTCSessionDescription(sdp));
       const answer = await this.peerConnection.connection.createAnswer();
       await this.peerConnection.connection.setLocalDescription(answer);
       
-      // Send answer to signaling server
       if (this.ws) {
         this.ws.send(JSON.stringify({
           type: 'answer',
           roomId: this.roomId,
-          sdp: answer
+          sdp: answer,
+          publicKey: this.encryptionKeys.publicKey
         }));
       }
     }
