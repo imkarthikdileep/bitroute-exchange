@@ -1,34 +1,34 @@
-
 import { ChangeEvent, DragEvent, useState } from "react";
-import { FileTransferProgress, formatFileSize, simulateFileTransfer } from "@/lib/webrtc";
+import { FileTransferProgress, WebRTCFileTransfer, formatFileSize } from "@/lib/webrtc";
 import { ProgressBar } from "./ProgressBar";
 import { Upload, X, Check, FileCode } from "lucide-react";
 
-export function FileUpload() {
+interface FileUploadProps {
+  webrtc: WebRTCFileTransfer;
+}
+
+export function FileUpload({ webrtc }: FileUploadProps) {
   const [isDragging, setIsDragging] = useState(false);
   const [transferFiles, setTransferFiles] = useState<FileTransferProgress[]>([]);
 
   const handleFileSelection = (files: FileList | null) => {
     if (!files) return;
     
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      simulateFileTransfer(file, (progress) => {
-        setTransferFiles(prev => {
-          // Find if file already exists in the list
-          const existingIndex = prev.findIndex(f => f.id === progress.id);
-          if (existingIndex >= 0) {
-            // Update existing entry
-            return prev.map((item, index) => 
-              index === existingIndex ? progress : item
-            );
-          } else {
-            // Add new entry
-            return [...prev, progress];
-          }
-        });
+    webrtc.addFiles(Array.from(files), (progress) => {
+      setTransferFiles(prev => {
+        // Find if file already exists in the list
+        const existingIndex = prev.findIndex(f => f.id === progress.id);
+        if (existingIndex >= 0) {
+          // Update existing entry
+          return prev.map((item, index) => 
+            index === existingIndex ? progress : item
+          );
+        } else {
+          // Add new entry
+          return [...prev, progress];
+        }
       });
-    }
+    });
   };
 
   const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
@@ -51,6 +51,7 @@ export function FileUpload() {
   };
 
   const removeFile = (id: string) => {
+    webrtc.cancelTransfer(id);
     setTransferFiles(prev => prev.filter(file => file.id !== id));
   };
 
@@ -116,6 +117,10 @@ export function FileUpload() {
                   {file.status === 'completed' 
                     ? 'Completed' 
                     : `${file.progress}% - ${file.status}`
+                  }
+                  {file.speed && file.status === 'transferring' && ` - ${formatFileSize(file.speed)}/s`}
+                  {file.timeRemaining && file.status === 'transferring' && 
+                    ` - ${Math.ceil(file.timeRemaining)}s remaining`
                   }
                 </p>
               </div>
